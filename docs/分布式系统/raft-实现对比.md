@@ -1,109 +1,399 @@
-# 四种语言 Raft 实现横向对比
+# 四种语言 Raft 实现对比：etcd、MongoDB 与 Redis 的共识差异
 
-> 素材来自源码走读笔记（etcd-io/raft · MongoDB pv1 · Redis Sentinel/Cluster）。标题写「四种语言」，正文以 **Go / C++ / C** 三套生产实现为主；Java 侧（Ratis / SOFAJRaft）放在「如果再来一次」里作为落地参照。
+> 素材来自源码走读笔记（etcd-io/raft · MongoDB pv1 · Redis Sentinel/Cluster）。标题写“四种语言”，正文以 Go / C++ / C 三套生产实现为主；Java 侧（Ratis / SOFAJRaft）放在最后作为选型参考。
 
-## 1. 我面对的真实问题
+## 1. 背景
 
-做低延迟行情与订阅中心时，绕不开「多副本怎么保证不丢、不脑裂」。团队里常听到三种说法：
+在之前的项目里，多副本的数据一致性问题无法回避。团队内部经常能听到几种判断：
 
-- 「etcd 用的是 Raft，所以安全」
-- 「MongoDB 副本集也是 Raft」
-- 「Redis 有 Sentinel / Cluster，选举也像 Raft」
+- “etcd 用的是 Raft，所以安全。”
+- “MongoDB 副本集也是 Raft，主备自动切换。”
+- “Redis Sentinel 和 Cluster 的选举机制跟 Raft 差不多。”
 
-选型或排障时，如果把这三者当成同一种共识，会在 **写入丢失窗口**、**提交语义**、**成员变更** 上踩坑。我需要的不是论文复述，而是：**它们各自到底是不是 Raft、差在哪、默认配置下客户端能信什么**。
+这些说法如果被当成同一种保证，选型或排查故障时就容易在写入丢失窗口、提交语义、成员变更这些地方出问题。我需要的不是重复论文内容，而是搞清楚：**它们各自到底是不是 Raft？具体差在哪？在默认配置下，客户端能依赖什么？**
 
-于是对照三份实现做了并排走读：`etcd-io/raft`（Go）、MongoDB `pv1`（C++）、Redis `sentinel.c` / `cluster_legacy.c`（C）。
+为了回答这些问题，我对三份实现做了一次并排走读：`etcd-io/raft`（Go）、MongoDB `pv1`（C++）、Redis `sentinel.c` / `cluster_legacy.c`（C）。下面是对比记录。
 
-## 2. 我调研了什么、踩了什么坑
+## 2. 整体定性：是不是 Raft
 
-### 2.1 总览：先分清「是不是 Raft」
+很多系统提到“Raft”，其实只实现了选举和任期，而没有覆盖 Raft 安全性的两个核心约束：**日志的前缀匹配**，以及 **commit index 必须由当前任期的条目在多数派复制后才能推进**。这两点才是“已确认写入不丢失”的根基。
 
-| 维度 | **etcd-io/raft（Go）** | **MongoDB pv1（C++）** | **Redis Sentinel/Cluster（C）** |
-|------|----------------------|----------------------|-------------------------------|
-| **是否真正 Raft** | ✅ 完整 Raft（论文严格实现） | 🟡 类 Raft（借鉴任期与多数派选举，复制机制不同） | ❌ 非 Raft（Sentinel：受 Raft 启发的协调者选举；Cluster：gossip + epoch 投票） |
-| **核心抽象** | 纯状态机库，不做 I/O，经 `Ready` 交付工作包 | `ReplicationCoordinatorImpl` + `TopologyCoordinator` 驱动完整服务器逻辑 | `sentinel.c` 单体状态机 + `cluster_legacy.c` gossip 循环 |
+先把三者的基本情况交代清楚：
 
-**踩坑点**：口头上的「我们有 Raft」往往只覆盖了「有选举 / 有任期」，没有覆盖 **日志匹配性质** 和 **commit index 规则**——后两者才是「已确认写入不会丢」的根基。
+- **etcd-io/raft**：完整的 Raft 实现，纯状态机库，不负责 I/O，通过 `Ready` 结构体把需要处理的工作交给上层。
+- **MongoDB pv1**：借鉴了任期和多数派选举，但复制机制是另一套基于 oplog 的拉取模型。我称之为“类 Raft”。
+- **Redis Sentinel/Cluster**：Sentinel 的选举受 Raft 启发，但它没有日志，只是选出一个协调者；Cluster 使用 gossip 加 epoch 投票。两者都不是 Raft，官方也未曾声称它们是。
 
-### 2.2 领导者选举
+这个定性是后续讨论的基础。
 
-| 维度 | **etcd** | **MongoDB** | **Redis** |
-|------|----------|------------|----------|
-| **任期 / 纪元** | `Term`，持久化在 `HardState` | `OpTime.term`；`TopologyCoordinator::_term`；`lastVote` 落盘 | Sentinel：`current_epoch`；Cluster：`currentEpoch` + `configEpoch` |
-| **预选举** | **PreVote**（`MsgPreVote`） | **dry-run election**（应用层预演） | 无；Sentinel 用随机延迟降冲突 |
-| **投票条件（日志新鲜度）** | `isUpToDate`：先比 last term，再比 last index | `lastWrittenOpTime >=` 投票者侧 | Sentinel：无日志新鲜度；Cluster：偏 configEpoch |
-| **每任期一票** | ✅ `r.Vote` + `HardState` | ✅ `LastVote` 落盘后才发真实投票 | ✅ epoch 守卫 |
+## 3. 领导者选举
 
-**结论片段**：etcd 的 PreVote 与 MongoDB 的 dry-run 目标相同——避免无谓 term 递增导致振荡；路径不同：一个是协议消息，一个是应用层预演。Redis **不做日志新鲜度限制**，只选「谁拿到多数票」，这是安全性弱于 Raft 的原因之一。
+三者的选举都想实现同一个目标：在网络分区或节点故障时尽快选出新主，同时尽量避免多主。
 
-### 2.3 日志 / 数据复制：推送 vs 拉取
+etcd 的做法很标准。每个节点把 `Term` 和投票记录持久化到 `HardState`，发起正式选举前会先做 **PreVote**（`MsgPreVote`）。节点先探明自己能否获得多数派的预投票，通过后才增加 term 并转为候选人。这减少了因网络隔离造成的 term 无谓增长和集群振荡。投票判定的核心逻辑（`raft.go`）：
 
-| 维度 | **etcd** | **MongoDB** | **Redis** |
-|------|----------|------------|----------|
-| **推 / 拉** | **推送**：leader 发 `MsgApp` | **拉取**：secondary `OplogFetcher` + tailable cursor | **推送**：`replicationFeedSlaves` 异步 backlog |
-| **条目标识** | `(index, term)` protobuf Entry | `OpTime = (Timestamp, term)`，无全局 Raft index | RESP 命令流 + `master_repl_offset`，无 term |
-| **一致性检查** | `(prevIndex, prevTerm)` 必须匹配 | 批次内 OpTime 单调；无 prevLogTerm 式强前缀检查 | 无复制日志共识；PSYNC 断点续传 |
-| **冲突处理** | 截断覆盖 + Next/Match 探测 | **rollback** 后重新拉取 | full resync / PSYNC，无按条目冲突解决 |
+```go
+case pb.MsgVote, pb.MsgPreVote:
+    // We can vote if this is a repeat of a vote we've already cast...
+    canVote := r.Vote == m.GetFrom() ||
+        // ...we haven't voted and we don't think there's a leader yet in this term...
+        (r.Vote == None && r.lead == None) ||
+        // ...or this is a PreVote for a future term...
+        (m.GetType() == pb.MsgPreVote && m.GetTerm() > r.Term)
+    // ...and we believe the candidate is up to date.
+    lastID := r.raftLog.lastEntryID()
+    candLastID := entryID{term: m.GetLogTerm(), index: m.GetIndex()}
+    if canVote && r.raftLog.isUpToDate(candLastID) {
+        // 授予投票...
+    }
+```
 
-**踩坑点**：推送模式下 leader 能精确维护 `Match/Next`（`tracker/progress.go`），commit 推导干净；拉取模式下 secondary 自选 sync source，leader 只能靠心跳里的 OpTime **间接**推多数派提交点——更灵活，安全性证明更绕。Redis 是流式主备，不是共识日志。
+`isUpToDate` 就是日志新鲜度检查：candidate 的 `(term, index)` 必须不落后于本地日志的最后一条。
 
-### 2.4 提交 / 持久化：差距最大的一维
+MongoDB 的设计思路类似，但实现位置不同。它在 `TopologyCoordinator` 中提供 **dry-run election**，算是一次应用层的预演。投票条件方面，要求候选者的 `lastWrittenOpTime` 不小于投票者，这与 Raft 的日志新鲜度检查意图一致。`lastVote` 也会落盘，确保每个任期只投一票（`topology_coordinator.cpp` `processReplSetRequestVotes`）：
 
-| 维度 | **etcd** | **MongoDB** | **Redis** |
-|------|----------|------------|----------|
-| **提交语义** | `commit index` = 多数派 match 的最大 index + **当前任期提交规则** | majority commit point（投票节点 OpTime 的第 majority 小值）+ term 边界 | 无集群范围 commit index |
-| **多数派写入** | ✅ 多数派持久化后才 committed | 🟡 需 `w:"majority"`（及 journal 相关配置） | ❌ 默认异步；ACK 后 replica 可能未收到 |
-| **写入丢失风险** | 已提交不可覆盖 | 默认 `w:1` 故障转移可能 rollback | 高：分区 + failover 可丢已 ACK 写入 |
+```cpp
+} else if (args.getLastWrittenOpTime() < getMyLastWrittenOpTime()) {
+    response->setVoteGranted(false);
+    response->setReason(fmt::format(
+        "candidate's data is staler than mine. candidate's last written OpTime: {}, "
+        "my last written OpTime: {}", ...));
+} else if (!args.isADryRun() && _lastVote.getTerm() >= args.getTerm()) {
+    response->setVoteGranted(false);
+    response->setReason(fmt::format(
+        "already voted for another candidate ({}) this term ({})", ...));
+} else {
+    ...
+    if (!args.isADryRun()) {
+        _lastVote.setTerm(args.getTerm());
+        _lastVote.setCandidateIndex(args.getCandidateIndex());
+    }
+    response->setVoteGranted(true);
+}
+```
 
-**踩坑点（最常见）**：把 MongoDB 副本集默认当成「安全多副本」。默认 `w:1` 只等 primary 确认；只有 `w: "majority"`（并配合 journal / `writeConcernMajorityShouldJournal`）才接近 Raft commit 的持久性。Redis Sentinel 源码注释也写明 ODOWN 是 **弱法定人数信号**，不保证强一致。
+可以看到 `isADryRun()` 贯穿整个判定：dry-run 阶段不落盘 `lastVote`，只有真实选举才会持久化投票记录。
 
-### 2.5 成员变更与脑裂
+Redis Sentinel 没有预投票机制，通过随机延迟来降低多个节点同时成为候选人的概率。更关键的区别在于，**Sentinel 不做日志新鲜度检查**。它只关注谁先拿到多数票，而不要求候选者的数据版本比投票者更新。Redis Cluster 的选举偏向比较 `configEpoch`，同样没有类似 Raft 的日志完整性限制。这意味着有可能选出一个数据落后的节点作为新主，从而导致已经确认的写入在后续复制中被覆盖。
 
-| | **etcd** | **MongoDB** | **Redis** |
-|---|----------|------------|----------|
-| **成员变更** | 联合共识 / Simple ConfChange，走 Raft 日志 | `rs.reconfig()`，心跳传播，无 joint consensus | Cluster 可 `clusterBumpConfigEpochWithoutConsensus()`——注释标明「无共识」 |
-| **防脑裂** | quorum + term；无多数派无法提交 | 多数派选举 + stepdown | 旧 master 可继续写直到被重定向；窗口内写入可能丢 |
+![三种系统的领导者选举流程对比](./diagrams/raft-election-models.png)
+> 配图源文件：`diagrams/raft-election-models.excalidraw`，用 excalidraw.com 打开后截图替换。
 
-脑裂防护力度大致是：**etcd > MongoDB（majority WC）> Redis**。
+## 4. 日志 / 数据复制
 
-## 3. 最终结论和数据
+复制机制是三套系统分歧最大的地方。
 
-> 下列「数据」主要是**结构结论与源码锚点**，不是压测数字。延迟/吞吐需按业务单独测。
+etcd 采用 **推送模型**。leader 向每个 follower 发送 `MsgApp` 消息，其中包含 `(prevLogIndex, prevLogTerm)`。follower 校验自己日志中对应位置的条目是否与这两个值完全一致，一致才追加，否则拒绝。leader 根据拒绝信息回退 `Next` 索引，逐步找到匹配点，然后覆盖冲突部分。凭借这种前缀一致性检查，leader 可以通过 `progress tracker` 精确跟踪每个 follower 的 `Match` 和 `Next`，进而干净地推导哪些条目已复制到多数派、可以提交。follower 侧的核心逻辑（`raft.go` `handleAppendEntries`）：
 
-### 3.1 一句话结论
+```go
+func (r *raft) handleAppendEntries(m *pb.Message) {
+    a := logSliceFromMsgApp(m)
+    if a.prev.index < r.raftLog.committed {
+        r.send(&pb.Message{To: m.From, Type: pb.MsgAppResp.Enum(), Index: new(r.raftLog.committed)})
+        return
+    }
+    if mlastIndex, ok := r.raftLog.maybeAppend(a, m.GetCommit()); ok {
+        r.send(&pb.Message{To: m.From, Type: pb.MsgAppResp.Enum(), Index: new(mlastIndex)})
+        return
+    }
+    // 日志不匹配：返回一个 (index, term) 猜测点，供 leader 回退 Next
+    hintIndex := min(m.GetIndex(), r.raftLog.lastIndex())
+    hintIndex, hintTerm := r.raftLog.findConflictByTerm(hintIndex, m.GetLogTerm())
+    r.send(&pb.Message{
+        To: m.From, Type: pb.MsgAppResp.Enum(), Index: new(m.GetIndex()),
+        Reject: new(true), RejectHint: new(hintIndex), LogTerm: new(hintTerm),
+    })
+}
+```
 
-1. **etcd-io/raft**：真正 Raft——日志匹配性质 + 当前任期提交规则成立；「已确认 ≈ 已提交 ≈ 多数派持久化」。
-2. **MongoDB pv1**：类 Raft——选举与 term 像 Raft，复制是 **oplog 拉取 + rollback**；安全性取决于客户端 **writeConcern**，不是「开了副本集就安全」。
-3. **Redis Sentinel/Cluster**：不是 Raft——选举协调 + 异步复制；故障转移场景下 **已 ACK 写入可能丢失**。
-4. **Java 生态**（未在本文逐行走读）：Apache Ratis、SOFAJRaft 走 **推送 + progress tracker** 路线，工程模板更接近 etcd，而不是 MongoDB 拉取模型。
+`maybeAppend` 内部先用 `matchTerm` 校验 `prevLogIndex/prevLogTerm`，不匹配就整批拒绝，这正是前缀一致性的落地代码。
 
-### 3.2 「真正 Raft」只认两件事
+MongoDB 是 **拉取模型**。secondary 通过 `OplogFetcher` 以类似 tailable cursor 的方式从同步源拉取 oplog。这给予了选同步源的灵活性，但 leader 无法直接知道每个副本的确切复制进度，只能依靠心跳中上报的 `OpTime` 来间接推算多数派提交点。条目标识是 `(Timestamp, term)`，没有全局 Raft index；一致性检查保证批次内 OpTime 单调，但不做 `prevLogTerm` 那样的强前缀匹配。发生冲突时不会精确截断，而是走 rollback 再重新拉取的流程。`OplogFetcher` 的类注释直接点明了这套拉取语义（`oplog_fetcher.h`）：
 
-- AppendEntries 的 **日志匹配性质**（前缀一致）
-- commit 推进遵守 **当前 term 条目先复制到多数派**，旧 term 只能间接提交
+```cpp
+/**
+ * The oplog fetcher, once started, reads operations from a remote oplog using a tailable,
+ * awaitData, exhaust cursor.
+ *
+ * The initial `find` command is generated from the last fetched optime.
+ * ...
+ * When there is an error, it will create a new cursor by issuing a new `find` command to the
+ * sync source.
+ */
+class OplogFetcher : public AbstractAsyncComponent<...> { ... };
+```
 
-MongoDB / Redis 都不完整满足这两点，因此在极端分区下有不同程度的数据风险——这不是「实现质量差」，而是 **协议形状不同**。
+Redis 是经典的 **异步主备复制**。master 将命令流写入 backlog 缓冲区，slave 通过 `PSYNC` 从某个偏移量续传。消息中只有 RESP 命令和 `master_repl_offset`，没有 term，也没有日志共识。如果断开过久，就只能全量重同步。`masterTryPartialResynchronization` 里能看到判定依据只是 `replid`（`replication.c`）：
 
-### 3.3 选型速查（估算级判断）
+```c
+int masterTryPartialResynchronization(client *c, long long psync_offset) {
+    char *master_replid = c->argv[1]->ptr;
+    /* Is the replication ID of this master the same advertised by the wannabe
+     * slave via PSYNC? If the replication ID changed this master has a
+     * different replication history, and there is no way to continue. */
+    if (strcasecmp(master_replid, server.replid) &&
+        (strcasecmp(master_replid, server.replid2) ||
+         psync_offset > server.second_replid_offset))
+    {
+        ...
+        goto need_full_resync;
+    }
+    ...
+}
+```
 
-| 你的约束 | 更合理的默认 |
-|---|---|
-| 元数据 / 配置中心，强一致优先 | etcd（或同等严格 Raft 库） |
-| 文档库，可接受显式 majority WC | MongoDB + `w:"majority"` |
-| 缓存 / 会话 / 可丢可重建 | Redis；别当强一致账本 |
-| 自研 Java 共识组件 | 优先对照 Ratis / JRaft（推送模型），不要照搬 Redis 选举叙事 |
+没有 term、没有 `(prevIndex, prevTerm)`，能续传只取决于 `replid` 相不相同、`offset` 是否还在 backlog 范围内。
 
-## 4. 如果再来一次我会怎么做
+对比可以看出，etcd 的推送 + 前缀检查为提交安全性提供了坚实基础；MongoDB 的拉取更灵活，但多数派提交点的推导路径更长；Redis 则是流式复制，没有共识日志层面的冲突解决。
 
-1. **先画「写入安全窗口」表**：对每个候选组件写清——默认 ACK 是否等于多数派持久化；分区时旧主能否继续写；failover 后未提交数据走覆盖还是 rollback。
-2. **禁止用「有选举」当「有 Raft」**：评审里强制对照：有没有 `(prevIndex, prevTerm)`、有没有 commit index、成员变更是否走共识日志。
-3. **MongoDB 默认配置当红线**：业务若不能丢写，配置与客户端 SDK 统一 `majority`，并在故障演练里验证 rollback 行为。
-4. **自研或嵌入式共识**：以 etcd-io/raft 的 `Ready` + progress tracker 为模板；Java 直接读 Ratis/JRaft，而不是从 Redis Cluster 的 epoch 投票「反向发明 Raft」。
-5. **补第四种语言的对照篇**：单独写一篇 Ratis / SOFAJRaft 与 etcd 的 API/线程模型差异（本次只落到选型结论，未展开源码表）。
+![Raft 系统日志复制模型对比：推 / 拉 / 异步流](./diagrams/raft-replication-models.png)
+> 配图源文件：`diagrams/raft-replication-models.excalidraw`，用 excalidraw.com 打开后截图替换。
+
+## 5. 提交语义
+
+这一部分在实际使用中差别最大，也最容易因为默认配置而产生误解。
+
+etcd 的 `commit index` 严格等于多数派节点上 `match` 的最大索引值，并且需要满足“当前任期的至少一条条目已被多数派复制”这一附加规则。这保证了一条日志一旦显示为 committed，就一定已持久化在多数节点的存储中，任何未来的 leader 都会包含这条日志。“当前任期”规则就写在 `maybeCommit` 里（`log.go` + `tracker.go`）：
+
+```go
+func (l *raftLog) maybeCommit(at entryID) bool {
+    // NB: term should never be 0 on a commit because the leader campaigned at
+    // least at term 1. But if it is 0 for some reason, we don't consider this a
+    // term match.
+    if at.term != 0 && at.index > l.committed && l.matchTerm(at) {
+        l.commitTo(at.index)
+        return true
+    }
+    return false
+}
+
+// Committed returns the largest log index known to be committed based on what
+// the voting members of the group have acknowledged.
+func (p *ProgressTracker) Committed() uint64 {
+    return uint64(p.Voters.CommittedIndex(matchAckIndexer(p.Progress)))
+}
+```
+
+`at.term` 必须等于 leader 自己的当前 term，这就是“只提交当前任期条目”的硬约束。
+
+MongoDB 要获得接近的持久性保证，需要显式配置 `w: "majority"` 并关注 journal 相关参数。因为它的默认 write concern 是 `w: 1`，只表示 primary 自己确认了写入。此时若 primary 故障，已 ACK 的操作可能在新主上不存在，出现 rollback 丢数据的情况。MongoDB 内部有 majority commit point 的计算逻辑，也会考虑 term 边界，但这些机制只有在 write concern 设为 majority 时才会对客户端生效。对应的 term 边界检查（`topology_coordinator.cpp` `advanceLastCommittedOpTimeAndWallTime`）：
+
+```cpp
+// This check is performed to ensure primaries do not commit an OpTime from a previous term.
+if (_iAmPrimary() && committedOpTime.opTime < _firstOpTimeOfMyTerm) {
+    return false;
+}
+if (!_selfConfig().isArbiter() &&
+    getMyLastWrittenOpTime().getTerm() != committedOpTime.opTime.getTerm()) {
+    if (fromSyncSource) {
+        committedOpTime = std::min(committedOpTime, getMyLastWrittenOpTimeAndWallTime());
+    } else {
+        // Ignoring commit point with different term than my lastWritten...
+        return false;
+    }
+}
+```
+
+这段代码和 etcd 的 `at.term != 0 && l.matchTerm(at)` 是同一个意图的两种写法，只是 MongoDB 把它做成了可选（依赖 `w: "majority"` 是否被启用）。
+
+Redis 不存在集群范围的 commit index。Sentinel 源码注释明确说明，ODOWN 只是一个弱法定人数信号，不保证强一致。在分区和故障转移场景下，客户端有可能收到旧 master 的写入成功回复，之后被重定向到新 master，而已回复成功的写入可能就此丢失。原文注释（`sentinel.c`）：
+
+```c
+/* Is this instance down according to the configured quorum?
+ *
+ * Note that ODOWN is a weak quorum, it only means that enough Sentinels
+ * reported in a given time range that the instance was not reachable.
+ * However messages can be delayed so there are no strong guarantees about
+ * N instances agreeing at the same time about the down state. */
+void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) { ... }
+```
+
+注释已经把结论写得很直白：ODOWN 是“弱法定人数”，不是共识意义上的 commit。
+
+简单总结：**“有副本集”与“写入已提交”是两回事，两者之间隔着一层配置语义。**
+
+![提交语义对比：客户端收到成功到底意味着什么](./diagrams/raft-commit-semantics.png)
+> 配图源文件：`diagrams/raft-commit-semantics.excalidraw`，用 excalidraw.com 打开后截图替换。
+
+## 6. 成员变更与脑裂
+
+成员变更是共识协议中最复杂的部分之一。etcd 支持联合共识和单步 ConfChange，变更请求本身作为一条 Raft 日志来复制，确保所有节点在同一配置上达成一致。在脑裂场景下，失去多数派的旧 leader 无法继续提交任何新条目。变更条目和普通日志走的是同一条路径（`raft.go` `stepLeader`）：
+
+```go
+if e.GetType() == pb.EntryConfChange {
+    ccc := &pb.ConfChange{}
+    if err := proto.Unmarshal(e.GetData(), ccc); err != nil {
+        panic(err)
+    }
+    cc = ccc
+} else if e.GetType() == pb.EntryConfChangeV2 {
+    ccc := &pb.ConfChangeV2{}
+    ...
+}
+if cc != nil {
+    alreadyPending := r.pendingConfIndex > r.raftLog.applied
+    alreadyJoint := len(r.trk.Config.Voters[1]) > 0
+    ...
+}
+```
+
+`EntryConfChange`/`EntryConfChangeV2` 只是普通 Entry 的一种类型标记，复制、提交、拒绝的规则和数据日志完全一样——这就是“变更请求本身作为一条 Raft 日志”的具体含义。
+
+MongoDB 的 `rs.reconfig()` 通过心跳传播新配置，没有采用联合共识。在极端多数派同时变更的场景下，风险会相对更高，但它仍然依赖多数派选举和 stepdown 来防止脑裂。心跳发现更新配置后走的是 `_scheduleHeartbeatReconfig`，而不是一条需要多数派提交的日志（`replication_coordinator_impl_heartbeat.cpp`）：
+
+```cpp
+case HeartbeatResponseAction::Reconfig:
+    invariant(responseStatus.getStatus());
+    _scheduleHeartbeatReconfig(lock, responseStatus.getValue().getConfig());
+    break;
+case HeartbeatResponseAction::RetryReconfig:
+    _scheduleHeartbeatReconfig(lock, rsc);
+    break;
+```
+
+新配置按 `(version, term)` 排序，谁的更新就采用谁的——这是“心跳传播”而不是“日志共识”的直接证据。
+
+Redis Cluster 有一个值得注意的函数 `clusterBumpConfigEpochWithoutConsensus()`，其注释直接标明“无共识”。旧 master 在分区期间仍可接受写入，直到被新配置 epoch 重定向为止。这期间的写入没有强一致性保障。函数注释原文（`cluster_legacy.c`）：
+
+```c
+/* Important note: this function violates the principle that config epochs
+ * should be generated with consensus and should be unique across the cluster. */
+int clusterBumpConfigEpochWithoutConsensus(void) {
+    uint64_t maxEpoch = clusterGetMaxEpoch();
+    if (myself->configEpoch == 0 || myself->configEpoch != maxEpoch) {
+        server.cluster->currentEpoch++;
+        myself->configEpoch = server.cluster->currentEpoch;
+        ...
+        return C_OK;
+    }
+    return C_ERR;
+}
+```
+
+“violates the principle that config epochs should be generated with consensus”——这是 Redis 官方代码注释自己写的，不是我的引申。
+
+脑裂防护力度从强到弱大致是：**etcd > 正确配置 majority write concern 的 MongoDB > Redis**。
+
+![成员变更与脑裂防护对比：分区期间旧 leader 还能写吗](./diagrams/raft-split-brain.png)
+> 配图源文件：`diagrams/raft-split-brain.excalidraw`，用 excalidraw.com 打开后截图替换。
+
+## 7. 选型参考
+
+基于这次走读，我整理了下面的判断，便于日后选型时对照。
+
+- **etcd（或同样严格的 Raft 库）**：适合元数据管理、配置中心等对强一致有硬性要求的场景。已确认的写入就是多数派持久化。
+- **MongoDB**：如果数据不能丢失，务必在客户端统一设置 `w: "majority"`，并理解 rollback 行为。不应该把“开了副本集”直接等同于“安全多副本”。
+- **Redis**：适合缓存、会话等可重建数据。不要把它当强一致账本使用，故障转移窗口内的写入丢失是协议允许的。
+- **Java 自研共识组件**：建议优先对照 Apache Ratis 或 SOFAJRaft，它们的模型接近 etcd 的推送 + progress tracker，而不是照着 Redis Cluster 的 epoch 投票去推导 Raft。
+
+判断一个系统是不是真正实现了 Raft，最核心的检查点仍然是两个：是否强制做 `(prevIndex, prevTerm)` 前缀匹配；commit 推进是否要求当前任期的条目先被多数派复制。
+
+MongoDB 和 Redis 不完全满足这两条。这并不是说它们“做得不好”，而是它们本来就不承诺和 Raft 一样的安全边界。协议形状不同，能给的承诺自然不同。
+
+## 8. 后续怎么做
+
+如果再次面对类似选型，我会先完成下面几件事：
+
+1. 为每个候选组件整理一张“写入安全窗口”表，明确：默认 ACK 的含义、分区时旧主是否能写入、故障转移后未提交数据是覆盖还是 rollback。
+2. 评审中不再接受“有选举”等同于“有 Raft”的说法，直接要求对方说明是否存在 `(prevIndex, prevTerm)` 检查、集群级 commit index、成员变更是否走共识日志。
+3. 如果选 MongoDB 且要求不丢写，把 `majority` 作为基准配置，并通过故障演练验证 rollback 场景。
+4. 若未来涉及嵌入式或自研共识库，以 etcd-io/raft 的 `Ready` + progress tracker 为工程参照。Java 栈直接深入 Ratis/JRaft。
+5. 另找时间写一篇 Java 侧的对比，详细拆解 Ratis / SOFAJRaft 在 API 与线程模型上与 etcd 的差异。这篇文章只把结论放在这里。
 
 ---
 
-**相关阅读（站内规划）**
+## 9. 附录：更多源码片段
 
+正文里的引用已经够支撑每一节的结论，下面这些是走读时顺带记的补充片段，感兴趣可以展开看，不影响正文的完整性。
+
+### 9.1 选举补充：Redis Sentinel 的随机延迟
+
+第 3 节提到 Sentinel 用随机延迟降低多候选人冲突，具体是这一句（`sentinel.c` `sentinelStartFailover`）：
+
+```c
+void sentinelStartFailover(sentinelRedisInstance *master) {
+    serverAssert(master->flags & SRI_MASTER);
+    master->failover_state = SENTINEL_FAILOVER_STATE_WAIT_START;
+    master->flags |= SRI_FAILOVER_IN_PROGRESS;
+    master->failover_epoch = ++sentinel.current_epoch;
+    sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
+        (unsigned long long) sentinel.current_epoch);
+    sentinelEvent(LL_WARNING,"+try-failover",master,"%@");
+    master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
+    master->failover_state_change_time = mstime();
+}
+```
+
+`rand()%SENTINEL_MAX_DESYNC` 直接加在启动时间上，纯粹是为了错开多个 Sentinel 同时发起 failover，跟日志/数据没有任何关系。
+
+### 9.2 复制补充：etcd 的 Match/Next 与冲突回退
+
+第 4 节提到 leader 靠 `progress tracker` 跟踪每个 follower 的 `Match`/`Next`（`tracker/progress.go`）：
+
+```go
+type Progress struct {
+    // Match is the index up to which the follower's log is known to match the leader's.
+    Match uint64
+    // Next is the log index of the next entry to send to this follower. All
+    // entries with indices in (Match, Next) interval are already in flight.
+    //
+    // Invariant: 0 <= Match < Next.
+    Next uint64
+    // ...
+}
+
+// MaybeUpdate is called when an MsgAppResp arrives from the follower.
+func (pr *Progress) MaybeUpdate(n uint64) bool {
+    if n <= pr.Match {
+        return false
+    }
+    pr.Match = n
+    pr.Next = max(pr.Next, n+1)
+    pr.MsgAppFlowPaused = false
+    return true
+}
+```
+
+而 `findConflictByTerm` 的文档注释解释了“回退 Next 找匹配点”具体在猜什么（`log.go`）：
+
+```go
+// findConflictByTerm returns a best guess on where this log ends matching
+// another log, given that the only information known about the other log is the
+// (index, term) of its single entry.
+//
+// Specifically, the first returned value is the max guessIndex <= index, such
+// that term(guessIndex) <= term or term(guessIndex) is not known (because this
+// index is compacted or not yet stored).
+func (l *raftLog) findConflictByTerm(index uint64, term uint64) (uint64, uint64) { ... }
+```
+
+### 9.3 成员变更补充：MongoDB 心跳 reconfig 的并发保护
+
+第 6 节提到 MongoDB 靠心跳传播配置、没有联合共识；对应地，它也没有 Raft 那种“配置变更本身要走多数派提交”的保护，只能用一个状态机粗粒度地防止并发 reconfig（`replication_coordinator_impl_heartbeat.cpp` `_scheduleHeartbeatReconfig`）：
+
+```cpp
+switch (_rsConfigState) {
+    case kConfigUninitialized:
+    case kConfigSteady:
+        LOGV2_FOR_HEARTBEATS(4615622, 1, "Received new config via heartbeat", ...);
+        break;
+    case kConfigInitiating:
+    case kConfigReconfiguring:
+    case kConfigHBReconfiguring:
+        LOGV2_FOR_HEARTBEATS(4615623, 1,
+            "Ignoring new configuration because we are already in the midst of a configuration "
+            "process", ...);
+        return;
+    ...
+}
+```
+
+这是一个本地状态标志位，不是共识协议——和 etcd 的 ConfChange 走日志复制相比，安全边界明显更弱。
+
+---
+
+> 这次走读没有做性能压测，所有结论都基于源码结构和协议路径的梳理。对我来说，这已经足够回答最初的问题：**在不同多副本方案面前，我可以相信什么。**
+
+**相关阅读（站内规划）**
 - 从 Raft 论文到生产实现：工程师阅读路径（待写）
 - 消息中间件选型：Redpanda 能替代什么（待写）
