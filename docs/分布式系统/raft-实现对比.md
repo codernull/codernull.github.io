@@ -76,8 +76,7 @@ MongoDB 的设计思路类似，但实现位置不同。它在 `TopologyCoordina
 
 Redis Sentinel 没有预投票机制，通过随机延迟来降低多个节点同时成为候选人的概率。更关键的区别在于，**Sentinel 不做日志新鲜度检查**。它只关注谁先拿到多数票，而不要求候选者的数据版本比投票者更新。Redis Cluster 的选举偏向比较 `configEpoch`，同样没有类似 Raft 的日志完整性限制。这意味着有可能选出一个数据落后的节点作为新主，从而导致已经确认的写入在后续复制中被覆盖。
 
-![三种系统的领导者选举流程对比](./diagrams/raft-election-models.png)
-> 配图源文件：`diagrams/raft-election-models.excalidraw`，用 excalidraw.com 打开后截图替换。
+> 图示源文件暂存于 `diagrams/raft-election-models.excalidraw`，PNG 导出完成后再嵌入正文。
 
 ## 4. 日志 / 数据复制
 
@@ -146,8 +145,7 @@ int masterTryPartialResynchronization(client *c, long long psync_offset) {
 
 对比可以看出，etcd 的推送 + 前缀检查为提交安全性提供了坚实基础；MongoDB 的拉取更灵活，但多数派提交点的推导路径更长；Redis 则是流式复制，没有共识日志层面的冲突解决。
 
-![Raft 系统日志复制模型对比：推 / 拉 / 异步流](./diagrams/raft-replication-models.png)
-> 配图源文件：`diagrams/raft-replication-models.excalidraw`，用 excalidraw.com 打开后截图替换。
+> 图示源文件暂存于 `diagrams/raft-replication-models.excalidraw`，PNG 导出完成后再嵌入正文。
 
 ## 5. 提交语义
 
@@ -212,8 +210,7 @@ void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) { ... }
 
 简单总结：**“有副本集”与“写入已提交”是两回事，两者之间隔着一层配置语义。**
 
-![提交语义对比：客户端收到成功到底意味着什么](./diagrams/raft-commit-semantics.png)
-> 配图源文件：`diagrams/raft-commit-semantics.excalidraw`，用 excalidraw.com 打开后截图替换。
+> 图示源文件暂存于 `diagrams/raft-commit-semantics.excalidraw`，PNG 导出完成后再嵌入正文。
 
 ## 6. 成员变更与脑裂
 
@@ -274,8 +271,7 @@ int clusterBumpConfigEpochWithoutConsensus(void) {
 
 脑裂防护力度从强到弱大致是：**etcd > 正确配置 majority write concern 的 MongoDB > Redis**。
 
-![成员变更与脑裂防护对比：分区期间旧 leader 还能写吗](./diagrams/raft-split-brain.png)
-> 配图源文件：`diagrams/raft-split-brain.excalidraw`，用 excalidraw.com 打开后截图替换。
+> 图示源文件暂存于 `diagrams/raft-split-brain.excalidraw`，PNG 导出完成后再嵌入正文。
 
 ## 7. 选型参考
 
