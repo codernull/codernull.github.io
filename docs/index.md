@@ -15,7 +15,7 @@ hero:
 
 features:
   - title: 分布式系统
-    details:  共识协议源码级对比与生产取舍
+    details:  共识、复制、消息中间件-共识协议源码级对比与生产取舍
     link: /分布式系统/
   - title: 低延迟系统
     details: 行情推送、抖动与唤醒路径 — 从测量数据到优化决策
