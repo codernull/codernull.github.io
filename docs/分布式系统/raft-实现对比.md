@@ -58,7 +58,19 @@ case pb.MsgVote, pb.MsgPreVote:
 
 `isUpToDate` 就是日志新鲜度检查：candidate 的 `(term, index)` 必须不落后于本地日志的最后一条。
 
-MongoDB 的设计思路类似，但实现位置不同。它在 `TopologyCoordinator` 中提供 **dry-run election**，算是一次应用层的预演。投票条件方面，要求候选者的 `lastWrittenOpTime` 不小于投票者，这与 Raft 的日志新鲜度检查意图一致。`lastVote` 也会落盘，确保每个任期只投一票（`topology_coordinator.cpp` `processReplSetRequestVotes`）：
+MongoDB 的核心工作是存储数据、响应查询。但为了实现“多副本 + 自动切主”，必须保证一条不变式：任意时刻最多只有一个节点能接受写入，防止两个节点同时认为自己是主而各自接收写入，导致数据不一致。在节点可能故障、网络可能自然分区的前提下，这只能依靠共识协议来保证。即便是“数据库”代码库，也需要一整套选举逻辑——`repl/` 目录正是集群模式下**数据正确性**的地基。  
+具体实现位于 `mongo/db/repl/topology_coordinator.cpp`，负责 `mongod` 复制集的选举协调；另一个相关模块是分片，位于 `db/s` 下，详情参见 [raft-横向扩展对比](xxx)。
+
+MongoDB 的设计思路与 etcd 类似：etcd 使用 PreVote 预投票机制，MongoDB 则通过区分不同的心跳触发场景来达到类似的控制效果，且实现位置不同——etcd 的 PreVote 在追随者节点内部触发，而 MongoDB 的选举决策位于心跳触发的决策层。共有四种触发场景：
+- `kElectionTimeout`：心跳超时，一直未发现 primary；
+- `kPriorityTakeover`：高优先级节点主动抢主；
+- `kCatchupTakeover`：节点追上进度后抢主；
+- `kStepUpRequestSkipDryRun`：手动执行 `rs.stepUp()` 时跳过 dry-run，直接发起真实选举。
+
+只有最后一种场景会跳过 dry-run；其余场景都会先发送一轮 `isADryRun=true` 的投票请求进行探路，探路成功后才发起真实选举——这就是代码中 `!args.isADryRun()` 判断的来源，用以区分 dry-run 预演和正式投票。  
+这种 dry-run 机制实现在 `TopologyCoordinator` 集群拓扑协调器中，是一次应用层的预演。与 PreVote 一样，它能有效减少因网络隔离导致的无谓任期增长、CPU 浪费和脑裂风险。
+
+投票条件方面，要求候选者的 `lastWrittenOpTime` 不小于投票者自己的 `lastWrittenOpTime`，这与 Raft 的日志新鲜度检查意图一致。同时，`_lastVote` 信息会持久化，确保每个任期只投一票。相关逻辑在 `topology_coordinator.cpp` 的 `processReplSetRequestVotes` 中：
 
 ```cpp
 } else if (args.getLastWrittenOpTime() < getMyLastWrittenOpTime()) {
