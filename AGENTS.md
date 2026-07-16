@@ -153,6 +153,7 @@ flowchart TD
 | 待处理 | Redpanda vs Kafka vs Aeron 五选项打分 | 消息中间件选型：Redpanda 能替代什么，不能替代什么 | 分布式系统 |
 | 待处理 | Aeron IPC 笔记 + 架构自测 | 微秒级延迟推送系统的 Aeron 选型实录 | 低延迟系统 |
 | 待处理 | 29 题架构自测 P0/P1/P2 复盘 | 架构自我评审：如何量化自己的短板 | 工程方法 |
+|待写|raft-横向对比|raft-横向对比|分布式系统|
 | 构思中 | 待确认 | Disruptor 使用场景 | 低延迟系统 |
 | 构思中 | 待确认 | Go WebSocket 客户端从零到一 | Go实战 |
 | 构思中 | 待确认 | WSL + Neovim 配置全记录 | Go实战 |
