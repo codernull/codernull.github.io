@@ -156,7 +156,7 @@ flowchart TD
 |待写|raft-横向对比|raft-横向对比|分布式系统|
 | 构思中 | 待确认 | Disruptor 使用场景 | 低延迟系统 |
 | 构思中 | 待确认 | Go WebSocket 客户端从零到一 | Go实战 |
-| 构思中 | 待确认 | WSL + Neovim 配置全记录 | Go实战 |
+| 已发布 | WSL Ubuntu 配置复查记录 | WSL + Neovim 配置全记录 | Go实战 |
 
 ---
 

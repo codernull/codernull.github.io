@@ -52,5 +52,7 @@ npm run docs:preview
 | 文章 | 路径 |
 |---|---|
 | 四种语言 Raft 实现横向对比 | [`docs/分布式系统/raft-实现对比.md`](docs/分布式系统/raft-实现对比.md) |
+| WSL + Neovim 配置全记录（可复现，不是插件安利） | [`docs/Go实战/wsl-neovim-配置全记录.md`](docs/Go实战/wsl-neovim-配置全记录.md) |
 
 素材来自 Dendron：`consensus.raft.comparison.md`（etcd / MongoDB / Redis 源码级对比）。
+素材来自 WSL Ubuntu 用户配置复查（用户名、目录已脱敏）。

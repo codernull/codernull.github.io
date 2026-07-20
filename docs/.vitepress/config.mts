@@ -39,7 +39,13 @@ export default defineConfig({
       '/Go实战/': [
         {
           text: 'Go 实战',
-          items: [{ text: '概览', link: '/Go实战/' }],
+          items: [
+            { text: '概览', link: '/Go实战/' },
+            {
+              text: 'WSL + Neovim 配置全记录',
+              link: '/Go实战/wsl-neovim-配置全记录',
+            },
+          ],
         },
       ],
       '/工程方法/': [
