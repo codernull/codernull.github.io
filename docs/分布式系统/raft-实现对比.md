@@ -57,7 +57,7 @@ case pb.MsgVote, pb.MsgPreVote:
 `isUpToDate` 就是日志新鲜度检查：candidate 的 `(term, index)` 必须不落后于本地日志的最后一条。
 
 `MongoDB` 的核心工作是存储数据、响应查询。但为了实现“多副本 + 自动切主”，必须保证一条不变式：任意时刻最多只有一个节点能接受写入，防止两个节点同时认为自己是主而各自接收写入，导致数据不一致。在节点可能故障、网络可能自然分区的前提下，这只能依靠共识协议来保证。即便是“数据库”代码库，也需要一整套选举逻辑——`repl/` 目录正是集群模式下**数据正确性**的地基。  
-具体实现位于 `mongo/db/repl/topology_coordinator.cpp`，负责 `mongod` 复制集的选举协调；另一个相关模块是分片，位于 `db/s` 下，详情参见 [raft-横向扩展对比](待写)。
+具体实现位于 `mongo/db/repl/topology_coordinator.cpp`，负责 `mongod` 复制集的选举协调；另一个相关模块是分片，位于 `db/s` 下，详情参见 raft-横向扩展对比（待写）。
 
 `MongoDB` 的设计思路与 etcd 类似：etcd 使用 `PreVote` 预投票机制，`MongoDB` 则通过dry-run机制在调度层发起选举。且实现位置不同——etcd 的 `PreVote` 在追随者节点内部触发，而 `MongoDB` 的选举决策位于心跳触发的决策层，决策层实现时区分不同的心跳触发场景来达到类似的控制效果。
 决策层共有四种触发场景：
