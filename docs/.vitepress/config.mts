@@ -33,7 +33,13 @@ export default defineConfig({
       '/低延迟系统/': [
         {
           text: '低延迟系统',
-          items: [{ text: '概览', link: '/低延迟系统/' }],
+          items: [
+            { text: '概览', link: '/低延迟系统/' },
+            {
+              text: '撮合引擎核心：订单簿结构、撮合语义与并发读取',
+              link: '/低延迟系统/撮合引擎核心',
+            },
+          ],
         },
       ],
       '/Go实战/': [

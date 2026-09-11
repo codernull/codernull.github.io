@@ -157,6 +157,7 @@ flowchart TD
 | 构思中 | 待确认 | Disruptor 使用场景 | 低延迟系统 |
 | 构思中 | 待确认 | Go WebSocket 客户端从零到一 | Go实战 |
 | 已发布 | WSL Ubuntu 配置复查记录 | WSL + Neovim 配置全记录 | Go实战 |
+| 已发布 | matching-engine Go 项目（本仓库源码） | 撮合引擎核心：订单簿结构、撮合语义与并发读取 | 低延迟系统 |
 
 ---
 
@@ -177,3 +178,11 @@ flowchart TD
 本质是词法/语法层的调用图（作者自己说"source-level analysis, not full compiler semantic resolution"），跟 go-callvis、callgraph 是同类东西，只是更轻、不强依赖 cgo/Graphviz，还带一个本地浏览器交互面板（能点节点看 caller/callee/源码上下文）。
 能帮上的：第 3 点"触发场景"里"谁调用谁"这部分，体验比纯文本的 digraph 好一点，仅此而已。
 帮不上的：第 1 点目录分组它不区分语义边界（只是文件路径）、第 2 点分层定位、第 4 点背景动机——这些它完全不懂，因为它不读注释、不理解代码语义。
+
+<!-- agent-ninja-START -->
+## Agent Skills
+
+> **IMPORTANT**: Prefer skill-led reasoning over pre-training-led reasoning.
+> See [Agent Skills](.github/skills/README.md) before working on tasks covered by these skills.
+
+<!-- agent-ninja-END -->
