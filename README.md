@@ -54,7 +54,11 @@ npm run docs:preview
 | 四种语言 Raft 实现横向对比 | [`docs/分布式系统/raft-实现对比.md`](docs/分布式系统/raft-实现对比.md) |
 | WSL + Neovim 配置全记录（可复现，不是插件安利） | [`docs/Go实战/wsl-neovim-配置全记录.md`](docs/Go实战/wsl-neovim-配置全记录.md) |
 | 撮合引擎核心：订单簿结构、撮合语义与并发读取 | [`docs/低延迟系统/撮合引擎核心.md`](docs/低延迟系统/撮合引擎核心.md) |
+| Redis 还是单线程：6.0/8.x 改了外围，热路径不该指望它 | [`docs/低延迟系统/redis-还是单线程.md`](docs/低延迟系统/redis-还是单线程.md) |
+| Redis 缓存设计：热 key、区间扫描、修正失效与集群批量 | [`docs/低延迟系统/redis-缓存设计.md`](docs/低延迟系统/redis-缓存设计.md) |
 
 素材来自 Dendron：`consensus.raft.comparison.md`（etcd / MongoDB / Redis 源码级对比）。
 素材来自 WSL Ubuntu 用户配置复查（用户名、目录已脱敏）。
 素材来自本仓库 `matching-engine`（Go 撮合引擎，源码与压测均可复现）。
+素材来自 Redis 官方仓库 pinned tag `6.0.0` / `8.8.0` 源码走读与 WSL 实测压测（redis-server 现编）。
+素材来自内部 K 线聚合推送实施方案与共享缓存组件（Redis 设计视角，已脱敏）。

@@ -39,6 +39,14 @@ export default defineConfig({
               text: '撮合引擎核心：订单簿结构、撮合语义与并发读取',
               link: '/低延迟系统/撮合引擎核心',
             },
+            {
+              text: 'Redis 还是单线程：6.0/8.x 改了外围，热路径不该指望它',
+              link: '/低延迟系统/redis-还是单线程',
+            },
+            {
+              text: 'Redis 缓存设计：热 key、区间扫描、修正失效与集群批量',
+              link: '/低延迟系统/redis-缓存设计',
+            },
           ],
         },
       ],
